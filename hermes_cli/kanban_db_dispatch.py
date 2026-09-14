@@ -72,6 +72,12 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
 )
 
 
+def _authz_admission(conn: sqlite3.Connection, task_id: str) -> tuple[bool, str]:
+    """Late-bound authorization import keeps the db facade cycle-free."""
+    from hermes_cli.kanban_db_authorization import authorization_admission
+    return authorization_admission(conn, task_id)
+
+
 @dataclass
 class DispatchResult:
     """Outcome of a single ``dispatch`` pass.
@@ -1507,6 +1513,13 @@ def _dispatch_lane_task(
     skip is recorded on ``result``.
     """
     task_id = row["id"]
+    # Admission is deliberately before claim and spawn.  It is repeated by
+    # claim_task inside its write transaction to close the revoke/claim race.
+    if not dry_run:
+        with _kb.write_txn(conn):
+            admitted, _reason = _authz_admission(conn, task_id)
+        if not admitted:
+            return False
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
@@ -1548,7 +1561,7 @@ def _dispatch_lane_task(
         _count_spawn(assignee)
         return True
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
-    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
+    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds, authorization_required=True)
     if claimed is None:
         return False
     try:

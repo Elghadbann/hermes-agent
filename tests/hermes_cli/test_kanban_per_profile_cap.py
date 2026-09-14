@@ -32,6 +32,13 @@ def _fake_spawn(*args, **kwargs):
     return 12345
 
 
+def _create_authorized_task(kb, conn, **kwargs):
+    task_id = kb.create_task(conn, created_by="owner", **kwargs)
+    kb.authorize_task(conn, task_id, owner="owner")
+    return task_id
+
+
+
 
 
 def test_cap_2_balances_two_profiles(isolated_kanban_home_with_profiles):
@@ -43,9 +50,9 @@ def test_cap_2_balances_two_profiles(isolated_kanban_home_with_profiles):
     with kbc.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
         for i in range(5):
-            kb.create_task(conn, title=f"a{i}", assignee="alpha")
+            _create_authorized_task(kb, conn, title=f"a{i}", assignee="alpha")
         for i in range(3):
-            kb.create_task(conn, title=f"b{i}", assignee="beta")
+            _create_authorized_task(kb, conn, title=f"b{i}", assignee="beta")
     with kbc.connect_closing() as conn:
         res = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=True,
@@ -70,7 +77,7 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
     from hermes_cli import kanban_db_dispatch as kbd
     with kbc.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
-        ids = [kb.create_task(conn, title=f"a{i}", assignee="alpha") for i in range(3)]
+        ids = [_create_authorized_task(kb, conn, title=f"a{i}", assignee="alpha") for i in range(3)]
 
     # First tick: cap=1, only 1 alpha dispatched
     with kbc.connect_closing() as conn:

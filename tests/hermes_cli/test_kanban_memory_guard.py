@@ -107,6 +107,13 @@ def test_pressure_level_classifies_via_gateway_thresholds():
     assert kbd._memory_pressure_level(elevated) == "elevated"
 
 
+
+def _create_authorized_task(conn, **kwargs):
+    task_id = kb.create_task(conn, created_by="owner", **kwargs)
+    kb.authorize_task(conn, task_id, owner="owner")
+    return task_id
+
+
 # ---------------------------------------------------------------------------
 # dispatch_once under pressure
 # ---------------------------------------------------------------------------
@@ -135,7 +142,7 @@ def test_dispatch_spawns_nothing_under_critical_pressure(
 
     with kbc.connect() as conn:
         for title in ("a", "b", "c"):
-            kb.create_task(conn, title=title, assignee="alice")
+            _create_authorized_task(conn, title=title, assignee="alice")
         res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
 
     assert not spawns
@@ -156,7 +163,7 @@ def test_dispatch_critical_pressure_defers_not_drops(
         return 42
 
     with kbc.connect() as conn:
-        task = kb.create_task(conn, title="a", assignee="alice")
+        task = _create_authorized_task(conn, title="a", assignee="alice")
         kbd.dispatch_once(conn, spawn_fn=fake_spawn)
         assert not spawns
         row = kb.get_task(conn, task)
@@ -183,7 +190,7 @@ def test_dispatch_elevated_pressure_spawns_at_most_one(
 
     with kbc.connect() as conn:
         for title in ("a", "b", "c"):
-            kb.create_task(conn, title=title, assignee="alice")
+            _create_authorized_task(conn, title=title, assignee="alice")
         res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
 
     assert len(spawns) == 1
@@ -206,7 +213,7 @@ def test_dispatch_elevated_pressure_does_not_widen_tighter_budget(
     with kbc.connect() as conn:
         running = kb.create_task(conn, title="running", assignee="alice")
         kb.claim_task(conn, running)
-        kb.create_task(conn, title="ready", assignee="bob")
+        _create_authorized_task(conn, title="ready", assignee="bob")
         res = kbd.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=1)
 
     assert not spawns
@@ -225,7 +232,7 @@ def test_dispatch_unknown_pressure_imposes_no_restriction(
 
     with kbc.connect() as conn:
         for title in ("a", "b", "c"):
-            kb.create_task(conn, title=title, assignee="alice")
+            _create_authorized_task(conn, title=title, assignee="alice")
         res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
 
     assert len(spawns) == 3
@@ -241,7 +248,7 @@ def test_dispatch_critical_pressure_still_runs_reclaim_bookkeeping(
     )
     with kbc.connect() as conn:
         parent = kb.create_task(conn, title="parent", assignee="alice")
-        child = kb.create_task(
+        child = _create_authorized_task(
             conn, title="child", assignee="alice", parents=[parent],
         )
         conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (parent,))

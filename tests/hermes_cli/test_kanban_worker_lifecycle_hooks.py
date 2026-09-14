@@ -80,7 +80,8 @@ def test_dispatch_spawn_fires_worker_spawned(
 
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="t", assignee="alice")
+        tid = kb.create_task(conn, title="t", assignee="alice", created_by="owner")
+        kb.authorize_task(conn, tid, owner="owner")
         result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 4242)
         assert any(row[0] == tid for row in result.spawned)
     finally:
@@ -166,7 +167,8 @@ def test_raising_callbacks_never_break_worker_lifecycle(
     try:
         conn = kbc.connect()
         try:
-            tid = kb.create_task(conn, title="t", assignee="alice")
+            tid = kb.create_task(conn, title="t", assignee="alice", created_by="owner")
+            kb.authorize_task(conn, tid, owner="owner")
             result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 111)
             assert any(row[0] == tid for row in result.spawned)
 
@@ -203,7 +205,8 @@ def test_no_subscriber_short_circuits_worker_hooks(
     monkeypatch.setattr(lifecycle, "invoke_hook", _spy)
     conn = kbc.connect()
     try:
-        kb.create_task(conn, title="t", assignee="alice")
+        tid = kb.create_task(conn, title="t", assignee="alice", created_by="owner")
+        kb.authorize_task(conn, tid, owner="owner")
         kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 222)
     finally:
         conn.close()
