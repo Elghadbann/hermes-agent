@@ -727,6 +727,7 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
             if resolved not in _INITIALIZED_PATHS:
                 conn.executescript(_kb.SCHEMA_SQL)
                 _migrate_add_optional_columns(conn)
+                _migrate_reliability_schema(conn)
                 _INITIALIZED_PATHS.add(resolved)
 
         conn, _ = _open_configured(path, _init_if_needed)
@@ -763,6 +764,121 @@ def init_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> P
     with contextlib.closing(connect(path)):
         pass
     return path
+
+
+# KR-P0-1A schema foundation.  This migration only records future reliability
+# state; no current lifecycle reader consults these fields yet.  In particular,
+# legacy tasks default to a non-authorized state and remain governed by the
+# pre-existing runtime until the separately authorized transition facade lands.
+_RELIABILITY_MIGRATION_ID = "kr-p0-1a-reliability-foundation"
+_RELIABILITY_MIGRATION_VERSION = 2
+_RELIABILITY_TASK_COLUMNS = (
+    ("execution_policy", "execution_policy TEXT NOT NULL DEFAULT 'manual'"),
+    ("execution_authorized", "execution_authorized INTEGER NOT NULL DEFAULT 0 CHECK (execution_authorized IN (0, 1))"),
+    ("authorization_state", "authorization_state TEXT NOT NULL DEFAULT 'not_authorized' CHECK (authorization_state IN ('not_authorized', 'pending', 'authorized', 'revoked'))"),
+)
+_RELIABILITY_SCHEMA_STATEMENTS = (
+    """CREATE TABLE IF NOT EXISTS kanban_schema_ledger (
+        migration_id TEXT PRIMARY KEY,
+        version INTEGER NOT NULL,
+        checksum TEXT NOT NULL,
+        description TEXT NOT NULL,
+        applied_at INTEGER NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS kanban_execution_authorizations (
+        authorization_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'not_authorized'
+            CHECK (state IN ('not_authorized', 'pending', 'authorized', 'revoked')),
+        authorized_by TEXT,
+        authorized_at INTEGER,
+        expires_at INTEGER,
+        evidence_json TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS kanban_transition_attempts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT NOT NULL,
+        run_id INTEGER,
+        from_status TEXT,
+        to_status TEXT,
+        outcome TEXT NOT NULL DEFAULT 'pending',
+        actor_type TEXT,
+        actor_id TEXT,
+        reason TEXT,
+        authorization_id TEXT,
+        metadata_json TEXT,
+        attempted_at INTEGER NOT NULL,
+        completed_at INTEGER
+    )""",
+    """CREATE TABLE IF NOT EXISTS kanban_dependency_evaluations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT NOT NULL,
+        dependency_key TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'unknown'
+            CHECK (state IN ('unknown', 'pending', 'satisfied', 'blocked', 'error')),
+        evaluated_at INTEGER NOT NULL,
+        evaluator TEXT,
+        result_json TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS kanban_workspace_allocations (
+        allocation_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        workspace_kind TEXT,
+        workspace_path TEXT,
+        branch_name TEXT,
+        base_sha TEXT,
+        state TEXT NOT NULL DEFAULT 'unallocated'
+            CHECK (state IN ('unallocated', 'reserved', 'active', 'released', 'orphaned')),
+        owner TEXT,
+        allocated_at INTEGER,
+        released_at INTEGER,
+        metadata_json TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS kanban_provider_capabilities (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        provider TEXT NOT NULL,
+        capability TEXT NOT NULL,
+        supported INTEGER CHECK (supported IN (0, 1) OR supported IS NULL),
+        observation_state TEXT NOT NULL DEFAULT 'unknown'
+            CHECK (observation_state IN ('unknown', 'observed', 'expired', 'error')),
+        observed_at INTEGER,
+        expires_at INTEGER,
+        source TEXT,
+        evidence_json TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS kanban_acceptance_evidence (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT NOT NULL,
+        evidence_type TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'unknown'
+            CHECK (status IN ('unknown', 'pending', 'accepted', 'rejected', 'superseded')),
+        repository TEXT,
+        base_sha TEXT,
+        head_sha TEXT,
+        url TEXT,
+        payload_json TEXT,
+        recorded_at INTEGER NOT NULL,
+        recorded_by TEXT,
+        supersedes_id INTEGER
+    )""",
+)
+_RELIABILITY_INDEX_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS idx_execution_auth_task ON kanban_execution_authorizations(task_id)",
+    "CREATE INDEX IF NOT EXISTS idx_transition_attempts_task ON kanban_transition_attempts(task_id, attempted_at)",
+    "CREATE INDEX IF NOT EXISTS idx_transition_attempts_run ON kanban_transition_attempts(run_id, id)",
+    "CREATE INDEX IF NOT EXISTS idx_dependency_evaluations_task ON kanban_dependency_evaluations(task_id, evaluated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_workspace_allocations_task ON kanban_workspace_allocations(task_id)",
+    "CREATE INDEX IF NOT EXISTS idx_provider_capabilities_lookup ON kanban_provider_capabilities(provider, capability, observed_at)",
+    "CREATE INDEX IF NOT EXISTS idx_acceptance_evidence_task ON kanban_acceptance_evidence(task_id, recorded_at)",
+)
+_RELIABILITY_MIGRATION_CHECKSUM = hashlib.sha256(
+    "\n".join(
+        [*(f"{name}:{ddl}" for name, ddl in _RELIABILITY_TASK_COLUMNS),
+         *_RELIABILITY_SCHEMA_STATEMENTS, *_RELIABILITY_INDEX_STATEMENTS]
+    ).encode()
+).hexdigest()
 
 
 # Additive ``tasks`` columns in the order legacy DBs receive them (= physical
@@ -836,6 +952,64 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     return conn.execute(
         f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'"
     ).fetchone() is not None
+
+
+def _migrate_reliability_schema(conn: sqlite3.Connection) -> None:
+    """Install the KR-P0-1A additive schema foundation exactly once.
+
+    The ledger makes the migration version and definition observable.  Existing
+    rows receive conservative defaults only; no current lifecycle path reads
+    the new fields, so this stage cannot authorize or otherwise execute a task.
+    """
+    existing = None
+    if _table_exists(conn, "kanban_schema_ledger"):
+        existing = conn.execute(
+            "SELECT version, checksum FROM kanban_schema_ledger "
+            "WHERE migration_id = ?",
+            (_RELIABILITY_MIGRATION_ID,),
+        ).fetchone()
+        if existing is not None and (
+            int(existing["version"]) != _RELIABILITY_MIGRATION_VERSION
+            or existing["checksum"] != _RELIABILITY_MIGRATION_CHECKSUM
+        ):
+            raise RuntimeError(
+                f"Kanban schema migration ledger mismatch for {_RELIABILITY_MIGRATION_ID}"
+            )
+
+    cols = _column_names(conn, "tasks")
+    for name, ddl in _RELIABILITY_TASK_COLUMNS:
+        if name not in cols:
+            _add_column_if_missing(conn, "tasks", name, ddl)
+
+    for statement in _RELIABILITY_SCHEMA_STATEMENTS:
+        conn.execute(statement)
+    for statement in _RELIABILITY_INDEX_STATEMENTS:
+        conn.execute(statement)
+
+    row = conn.execute(
+        "SELECT version, checksum FROM kanban_schema_ledger WHERE migration_id = ?",
+        (_RELIABILITY_MIGRATION_ID,),
+    ).fetchone()
+    if row is None:
+        conn.execute(
+            """INSERT INTO kanban_schema_ledger
+               (migration_id, version, checksum, description, applied_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                _RELIABILITY_MIGRATION_ID,
+                _RELIABILITY_MIGRATION_VERSION,
+                _RELIABILITY_MIGRATION_CHECKSUM,
+                "KR-P0-1A additive reliability schema foundation",
+                int(time.time()),
+            ),
+        )
+    elif (
+        int(row["version"]) != _RELIABILITY_MIGRATION_VERSION
+        or row["checksum"] != _RELIABILITY_MIGRATION_CHECKSUM
+    ):
+        raise RuntimeError(
+            f"Kanban schema migration ledger mismatch for {_RELIABILITY_MIGRATION_ID}"
+        )
 
 
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
