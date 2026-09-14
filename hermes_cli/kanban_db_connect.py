@@ -771,7 +771,7 @@ def init_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> P
 # legacy tasks default to a non-authorized state and remain governed by the
 # pre-existing runtime until the separately authorized transition facade lands.
 _RELIABILITY_MIGRATION_ID = "kr-p0-1a-reliability-foundation"
-_RELIABILITY_MIGRATION_VERSION = 1
+_RELIABILITY_MIGRATION_VERSION = 2
 _RELIABILITY_TASK_COLUMNS = (
     ("execution_policy", "execution_policy TEXT NOT NULL DEFAULT 'manual'"),
     ("execution_authorized", "execution_authorized INTEGER NOT NULL DEFAULT 0 CHECK (execution_authorized IN (0, 1))"),
@@ -840,7 +840,7 @@ _RELIABILITY_SCHEMA_STATEMENTS = (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         provider TEXT NOT NULL,
         capability TEXT NOT NULL,
-        supported INTEGER,
+        supported INTEGER CHECK (supported IN (0, 1) OR supported IS NULL),
         observation_state TEXT NOT NULL DEFAULT 'unknown'
             CHECK (observation_state IN ('unknown', 'observed', 'expired', 'error')),
         observed_at INTEGER,
@@ -961,6 +961,21 @@ def _migrate_reliability_schema(conn: sqlite3.Connection) -> None:
     rows receive conservative defaults only; no current lifecycle path reads
     the new fields, so this stage cannot authorize or otherwise execute a task.
     """
+    existing = None
+    if _table_exists(conn, "kanban_schema_ledger"):
+        existing = conn.execute(
+            "SELECT version, checksum FROM kanban_schema_ledger "
+            "WHERE migration_id = ?",
+            (_RELIABILITY_MIGRATION_ID,),
+        ).fetchone()
+        if existing is not None and (
+            int(existing["version"]) != _RELIABILITY_MIGRATION_VERSION
+            or existing["checksum"] != _RELIABILITY_MIGRATION_CHECKSUM
+        ):
+            raise RuntimeError(
+                f"Kanban schema migration ledger mismatch for {_RELIABILITY_MIGRATION_ID}"
+            )
+
     cols = _column_names(conn, "tasks")
     for name, ddl in _RELIABILITY_TASK_COLUMNS:
         if name not in cols:

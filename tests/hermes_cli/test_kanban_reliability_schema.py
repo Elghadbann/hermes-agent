@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import sqlite3
 
+import pytest
+
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 
@@ -42,7 +44,7 @@ def test_fresh_schema_records_reliability_migration_and_safe_defaults(tmp_path):
             ("kr-p0-1a-reliability-foundation",),
         ).fetchone()
         assert ledger is not None
-        assert ledger["version"] == 1
+        assert ledger["version"] == 2
         assert ledger["checksum"]
 
         columns = {
@@ -222,3 +224,117 @@ def test_legacy_migration_preserves_rows_and_is_idempotent(tmp_path):
             ("kr-p0-1a-reliability-foundation",),
         ).fetchone()[0] == 1
         assert rerun.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    (("checksum", "tampered"), ("version", 999)),
+)
+def test_incompatible_ledger_fails_before_reliability_schema_mutation(
+    tmp_path, column, value
+):
+    db_path = tmp_path / f"mismatch-{column}.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(kb.SCHEMA_SQL)
+        conn.execute(
+            """CREATE TABLE kanban_schema_ledger (
+                migration_id TEXT PRIMARY KEY,
+                version INTEGER NOT NULL,
+                checksum TEXT NOT NULL,
+                description TEXT NOT NULL,
+                applied_at INTEGER NOT NULL
+            )"""
+        )
+        conn.execute(
+            """INSERT INTO kanban_schema_ledger
+               (migration_id, version, checksum, description, applied_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            ("kr-p0-1a-reliability-foundation", kbc._RELIABILITY_MIGRATION_VERSION,
+             kbc._RELIABILITY_MIGRATION_CHECKSUM, "test", 1),
+        )
+        conn.execute(
+            f"UPDATE kanban_schema_ledger SET {column} = ? WHERE migration_id = ?",
+            (value, "kr-p0-1a-reliability-foundation"),
+        )
+        conn.commit()
+
+    with pytest.raises(RuntimeError, match="schema migration ledger mismatch"):
+        kbc.connect(db_path).close()
+
+    with sqlite3.connect(db_path) as conn:
+        task_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(tasks)")
+        }
+        reliability_tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+            if row[0] in _RELIABILITY_TABLES - {"kanban_schema_ledger"}
+        }
+        reliability_indexes = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+            if row[0].startswith(
+                (
+                    "idx_execution_",
+                    "idx_transition_",
+                    "idx_dependency_",
+                    "idx_workspace_",
+                    "idx_provider_",
+                    "idx_acceptance_",
+                )
+            )
+        }
+        assert not {"execution_policy", "execution_authorized", "authorization_state"} & task_columns
+        assert reliability_tables == set()
+        assert reliability_indexes == set()
+
+
+def test_reliability_indexes_are_created(tmp_path):
+    db_path = tmp_path / "indexes.db"
+    kb.init_db(db_path=db_path)
+    with sqlite3.connect(db_path) as conn:
+        indexes = {
+            row[1]
+            for row in conn.execute(
+                "SELECT type, name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+    assert {
+        "idx_execution_auth_task",
+        "idx_transition_attempts_task",
+        "idx_transition_attempts_run",
+        "idx_dependency_evaluations_task",
+        "idx_workspace_allocations_task",
+        "idx_provider_capabilities_lookup",
+        "idx_acceptance_evidence_task",
+    } <= indexes
+
+
+def test_reliability_closed_set_constraints_reject_invalid_values(tmp_path):
+    db_path = tmp_path / "constraints.db"
+    kb.init_db(db_path=db_path)
+    with kbc.connect(db_path) as conn:
+        task_id = kb.create_task(conn, title="constraint-test")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO kanban_execution_authorizations "
+                "(authorization_id, task_id, state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("invalid-auth", task_id, "invalid", 1, 1),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO kanban_dependency_evaluations "
+                "(task_id, dependency_key, state, evaluated_at) VALUES (?, ?, ?, ?)",
+                (task_id, "parents", "invalid", 1),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO kanban_provider_capabilities "
+                "(provider, capability, supported) VALUES (?, ?, ?)",
+                ("provider", "capability", 2),
+            )
