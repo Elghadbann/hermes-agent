@@ -1,0 +1,153 @@
+name: Temporary Python worker measurement
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - measure/python-workers-standard-20260915
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporary-python-worker-measurement-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  measure:
+    name: Python workers (${{ matrix.candidate }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        candidate: [native, cpu-count, cpu-times-two]
+    steps:
+      - name: Checkout exact measurement revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Install ripgrep (prebuilt binary)
+        run: |
+          set -euo pipefail
+          RG_VERSION=15.1.0
+          RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
+          RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
+          curl -sSfL --retry 3 --retry-delay 5 -o "$RG_TARBALL" \
+            "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
+          echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
+          tar -xzf "$RG_TARBALL"
+          sudo mv "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
+          rm -rf "$RG_TARBALL" "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl"
+          rg --version
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.11
+
+      - name: Install dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+
+      - name: Minimize uv cache
+        run: uv cache prune --ci
+
+      - name: Record runner capacity and selection
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/worker-measurement"
+          {
+            echo "candidate=${{ matrix.candidate }}"
+            echo "github_sha=${GITHUB_SHA}"
+            echo "RUNNER_OS=${RUNNER_OS}"
+            echo "RUNNER_ARCH=${RUNNER_ARCH}"
+            echo "nproc=$(nproc)"
+            echo "getconf_nprocessors=$(getconf _NPROCESSORS_ONLN)"
+            echo "python_version=$(python --version 2>&1)"
+            python - <<'PY'
+          import platform
+          print(f"platform_platform={platform.platform()}")
+          print(f"platform_machine={platform.machine()}")
+          PY
+            free -h
+            echo "meminfo_memtotal=$(grep '^MemTotal:' /proc/meminfo)"
+          } | tee "$RUNNER_TEMP/worker-measurement/capacity.txt"
+          .venv/bin/python scripts/run_tests_parallel.py --generate-slices 1 > "$RUNNER_TEMP/worker-measurement/selection.json"
+          .venv/bin/python - "$RUNNER_TEMP/worker-measurement/selection.json" <<'PY' | tee "$RUNNER_TEMP/worker-measurement/selection.txt"
+          import hashlib
+          import json
+          import sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          files = data["slices"][0]["files"]
+          digest = hashlib.sha256("\n".join(files).encode()).hexdigest()
+          print(f"selection_files={len(files)}")
+          print(f"selection_sha256={digest}")
+          PY
+
+      - name: Run canonical Python suite for candidate
+        shell: bash
+        run: |
+          set -uo pipefail
+          report_dir="$RUNNER_TEMP/worker-measurement"
+          cpu_count="$(nproc)"
+          case "${{ matrix.candidate }}" in
+            native)
+              unset HERMES_TEST_WORKERS
+              expected_workers=$((cpu_count * 2))
+              worker_config="unset (native default)"
+              ;;
+            cpu-count)
+              export HERMES_TEST_WORKERS="$cpu_count"
+              expected_workers="$cpu_count"
+              worker_config="${HERMES_TEST_WORKERS} (CPU count)"
+              ;;
+            cpu-times-two)
+              if [ "$cpu_count" -gt 16 ]; then
+                echo "candidate skipped: cpu_count=${cpu_count} would make CPU*2 an excessive measurement" | tee "$report_dir/result.txt"
+                exit 0
+              fi
+              export HERMES_TEST_WORKERS=$((cpu_count * 2))
+              expected_workers="$HERMES_TEST_WORKERS"
+              worker_config="${HERMES_TEST_WORKERS} (CPU*2)"
+              ;;
+          esac
+          echo "effective_worker_expectation=$expected_workers" | tee "$report_dir/worker-config.txt"
+          echo "worker_config=$worker_config" | tee -a "$report_dir/worker-config.txt"
+          start_ns="$(date +%s%N)"
+          set +e
+          /usr/bin/time -v -o "$report_dir/time.txt" bash -c 'source .venv/bin/activate && scripts/run_tests.sh' > "$report_dir/test.log" 2>&1
+          rc=$?
+          set -e
+          end_ns="$(date +%s%N)"
+          .venv/bin/python - "$start_ns" "$end_ns" "$rc" "$report_dir" <<'PY' | tee "$report_dir/result.txt"
+          import pathlib
+          import sys
+          start, end, rc, report_dir = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), pathlib.Path(sys.argv[4])
+          print(f"exit_code={rc}")
+          print(f"wall_seconds={(end - start) / 1_000_000_000:.3f}")
+          time_text = (report_dir / "time.txt").read_text(errors="replace")
+          for line in time_text.splitlines():
+              if line.startswith(("Maximum resident set size", "User time", "System time", "Elapsed (wall clock)")):
+                  print(line)
+          log = (report_dir / "test.log").read_text(errors="replace")
+          for line in log.splitlines():
+              if any(word in line.lower() for word in ("flaky", "passed", "failed", "error")):
+                  print(f"summary: {line}")
+          PY
+          cat "$report_dir/result.txt"
+          cat "$report_dir/test.log"
+          exit "$rc"
