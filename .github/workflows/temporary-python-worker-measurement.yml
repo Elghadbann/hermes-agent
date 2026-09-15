@@ -92,7 +92,7 @@ jobs:
           import json
           import sys
           data = json.load(open(sys.argv[1], encoding="utf-8"))
-          files = data["slices"][0]["files"]
+          files = data["slice"][0]["files"].split(":")
           digest = hashlib.sha256("\n".join(files).encode()).hexdigest()
           print(f"selection_files={len(files)}")
           print(f"selection_sha256={digest}")
