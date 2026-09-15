@@ -501,8 +501,10 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
             conn,
             title="domain review",
             assignee="reviewer",
+            created_by="owner",
             skills=["domain-specific-review"],
         )
+        kb.authorize_task(conn, task_id, owner="owner")
         implementation = kb.claim_task(conn, task_id)
         assert implementation is not None
         assert kb.request_review(

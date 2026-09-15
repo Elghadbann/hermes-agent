@@ -46,7 +46,8 @@ def test_unassigned_task_auto_assigned_with_default_assignee(isolated_kanban_hom
     from hermes_cli import kanban_db_dispatch as kbd
     with kbc.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
-        task_id = kb.create_task(conn, title="t1", assignee=None)
+        task_id = kb.create_task(conn, title="t1", assignee=None, created_by="owner")
+        kb.authorize_task(conn, task_id, owner="owner")
     with kbc.connect_closing() as conn:
         res = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=False,
@@ -87,7 +88,8 @@ def test_explicitly_assigned_task_untouched_by_default_assignee(isolated_kanban_
     from hermes_cli import kanban_db_dispatch as kbd
     with kbc.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
-        task_id = kb.create_task(conn, title="t1", assignee="default")
+        task_id = kb.create_task(conn, title="t1", assignee="default", created_by="owner")
+        kb.authorize_task(conn, task_id, owner="owner")
     with kbc.connect_closing() as conn:
         res = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=False,

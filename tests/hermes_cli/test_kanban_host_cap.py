@@ -48,6 +48,12 @@ def _fake_spawn_factory(spawns: list):
     return fake_spawn
 
 
+def _create_authorized_task(conn: sqlite3.Connection, **kwargs) -> str:
+    task_id = kb.create_task(conn, created_by="owner", **kwargs)
+    kb.authorize_task(conn, task_id, owner="owner")
+    return task_id
+
+
 # ---------------------------------------------------------------------------
 # 1. Standalone daemon resolves max_in_progress (P1a)
 # ---------------------------------------------------------------------------
@@ -145,7 +151,7 @@ def test_max_in_progress_counts_other_boards(
 
     spawns: list = []
     with kbc.connect() as conn:
-        kb.create_task(conn, title="wants-to-run", assignee="alice")
+        _create_authorized_task(conn, title="wants-to-run", assignee="alice")
         res = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
         )
@@ -167,7 +173,7 @@ def test_max_in_progress_partial_budget_across_boards(
     spawns: list = []
     with kbc.connect() as conn:
         for title in ("a", "b", "c"):
-            kb.create_task(conn, title=title, assignee="alice")
+            _create_authorized_task(conn, title=title, assignee="alice")
         res = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
         )
@@ -197,7 +203,7 @@ def test_max_spawn_stays_per_board(kanban_home, all_assignees_spawnable):
 
     spawns: list = []
     with kbc.connect() as conn:
-        kb.create_task(conn, title="a", assignee="alice")
+        _create_authorized_task(conn, title="a", assignee="alice")
         res = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_spawn=1,
         )
@@ -213,7 +219,7 @@ def test_max_spawn_stays_per_board(kanban_home, all_assignees_spawnable):
 
 
 def _park_in_review(conn: sqlite3.Connection, title: str, assignee: str) -> str:
-    tid = kb.create_task(conn, title=title, assignee=assignee)
+    tid = _create_authorized_task(conn, title=title, assignee=assignee)
     _set_task_status(conn, tid, "review")
     return tid
 
@@ -230,7 +236,7 @@ def test_review_lane_gets_reserved_slot_under_ready_backlog(
     spawns: list = []
     with kbc.connect() as conn:
         for title in ("ready-1", "ready-2", "ready-3"):
-            kb.create_task(conn, title=title, assignee="alice")
+            _create_authorized_task(conn, title=title, assignee="alice")
         review_id = _park_in_review(conn, "review-me", "reviewer")
         res = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
@@ -254,7 +260,7 @@ def test_review_reservation_released_when_no_review_work(
     spawns: list = []
     with kbc.connect() as conn:
         for title in ("ready-1", "ready-2", "ready-3"):
-            kb.create_task(conn, title=title, assignee="alice")
+            _create_authorized_task(conn, title=title, assignee="alice")
         res = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
         )
@@ -282,7 +288,7 @@ def test_nonspawnable_review_does_not_tax_ready_budget(
     spawns: list = []
     with kbc.connect() as conn:
         for title in ("ready-1", "ready-2"):
-            kb.create_task(conn, title=title, assignee="alice")
+            _create_authorized_task(conn, title=title, assignee="alice")
         _park_in_review(conn, "human-review", "some-human")
         res = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
@@ -304,7 +310,7 @@ def test_review_budget_still_bounded_by_shared_cap(
 
     spawns: list = []
     with kbc.connect() as conn:
-        kb.create_task(conn, title="ready-1", assignee="alice")
+        _create_authorized_task(conn, title="ready-1", assignee="alice")
         for i in range(3):
             _park_in_review(conn, f"review-{i}", "reviewer")
         res = kbd.dispatch_once(
